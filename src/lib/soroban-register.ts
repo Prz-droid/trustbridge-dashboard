@@ -5,6 +5,35 @@ import type { Prisma } from "@prisma/client";
 import { rpc, Keypair, TransactionBuilder, Networks, Contract, Address, nativeToScVal } from "stellar-sdk";
 
 import { logger } from "./logger";
+import { CircuitBreaker, CircuitBreakerOpenError } from "@/lib/circuit-breaker";
+
+/**
+ * Soroban circuit breaker instance to protect against cascading RPC failures.
+ */
+const sorobanCircuitBreaker = new CircuitBreaker({
+  failureThreshold: Number.parseInt(
+    process.env.SOROBAN_CB_FAILURE_THRESHOLD ?? "5",
+    10
+  ) || 5,
+  successThreshold: Number.parseInt(
+    process.env.SOROBAN_CB_SUCCESS_THRESHOLD ?? "2",
+    10
+  ) || 2,
+  recoveryTimeoutMs: Number.parseInt(
+    process.env.SOROBAN_CB_RECOVERY_MS ?? "30000",
+    10
+  ) || 30000,
+});
+
+export function getSorobanCircuitBreakerState(): string {
+  return sorobanCircuitBreaker.getState();
+}
+
+export function getSorobanCircuitBreakerMetrics(): ReturnType<
+  typeof sorobanCircuitBreaker.getMetrics
+> {
+  return sorobanCircuitBreaker.getMetrics();
+}
 
 /**
  * Result of attempting to mirror a registration to a Soroban contract.
@@ -72,26 +101,29 @@ export async function mirrorRegistrationToSoroban(
   }
 
   try {
-    const server = new rpc.Server(rpcUrl);
-    const sourceKeypair = Keypair.fromSecret(secretKey);
-    const sourceAccount = await server.getAccount(sourceKeypair.publicKey());
+    // Wrap Soroban RPC calls with circuit breaker
+    const response = await sorobanCircuitBreaker.call(async () => {
+      const server = new rpc.Server(rpcUrl);
+      const sourceKeypair = Keypair.fromSecret(secretKey);
+      const sourceAccount = await server.getAccount(sourceKeypair.publicKey());
 
-    const contract = new Contract(contractId);
-    const username = githubUsername || registration.userId;
+      const contract = new Contract(contractId);
+      const username = githubUsername || registration.userId;
 
-    const txBuilder = new TransactionBuilder(sourceAccount, {
-      fee: "100", // 100 stroops base fee
-      networkPassphrase: Networks.PUBLIC,
+      const txBuilder = new TransactionBuilder(sourceAccount, {
+        fee: "100", // 100 stroops base fee
+        networkPassphrase: Networks.PUBLIC,
+      });
+
+      const tx = txBuilder
+        .addOperation(contract.call("register", ...buildRegisterArgs(registration.stellarAddress, username)))
+        .setTimeout(30)
+        .build();
+
+      tx.sign(sourceKeypair);
+
+      return await server.sendTransaction(tx);
     });
-
-    const tx = txBuilder
-      .addOperation(contract.call("register", ...buildRegisterArgs(registration.stellarAddress, username)))
-      .setTimeout(30)
-      .build();
-
-    tx.sign(sourceKeypair);
-
-    const response = await server.sendTransaction(tx);
 
     if (response.status === "PENDING") {
       // Transaction submitted and awaiting confirmation
@@ -141,6 +173,19 @@ export async function mirrorRegistrationToSoroban(
       errors: [],
     };
   } catch (error) {
+    // Handle circuit breaker open state
+    if (error instanceof CircuitBreakerOpenError) {
+      logger?.warn?.("Soroban circuit breaker is open", {
+        registrationId: registration.id,
+        contractId,
+        remainingMs: error.remainingMs,
+      });
+      return {
+        success: false,
+        errors: ["Soroban RPC is temporarily unavailable. Registration saved to database."],
+      };
+    }
+
     // Catch and log the error without blocking the registration flow.
     const message =
       error instanceof Error ? error.message : "Unknown error writing to Soroban";

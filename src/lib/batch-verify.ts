@@ -34,10 +34,128 @@ export interface BatchVerificationOptions {
    * Minimum XLM reserve requirement
    */
   minXlmReserve?: number;
+  /**
+   * Job ID for progress tracking across SSE disconnects
+   */
+  jobId?: string;
+  /**
+   * Callback for progress updates
+   */
+  onProgress?: (progress: BatchVerificationProgress) => void;
+}
+
+export interface BatchVerificationProgress {
+  jobId: string;
+  total: number;
+  completed: number;
+  succeeded: number;
+  failed: number;
+  percentage: number;
+  startedAt: Date;
+  lastUpdatedAt: Date;
+  isComplete: boolean;
+}
+
+export interface BatchVerificationState {
+  jobId: string;
+  total: number;
+  completed: number;
+  results: VerificationCheckResult[];
+  startedAt: Date;
+  lastUpdatedAt: Date;
+  isComplete: boolean;
 }
 
 /**
- * Execute multiple verification checks with concurrency control.
+ * In-memory store for batch verification progress.
+ * Survives SSE disconnects for the lifetime of the process.
+ */
+const batchVerificationJobs = new Map<string, BatchVerificationState>();
+
+/**
+ * How long to keep completed jobs in memory (5 minutes)
+ */
+const JOB_RETENTION_MS = 5 * 60 * 1000;
+
+/**
+ * Get the state of a batch verification job.
+ */
+export function getBatchVerificationState(
+  jobId: string,
+): BatchVerificationState | null {
+  return batchVerificationJobs.get(jobId) ?? null;
+}
+
+/**
+ * Initialize or resume a batch verification job.
+ */
+function initializeBatchJob(
+  jobId: string,
+  total: number,
+  existingResults: VerificationCheckResult[] = [],
+): BatchVerificationState {
+  const existing = batchVerificationJobs.get(jobId);
+  if (existing) {
+    return existing;
+  }
+
+  const state: BatchVerificationState = {
+    jobId,
+    total,
+    completed: existingResults.length,
+    results: existingResults,
+    startedAt: new Date(),
+    lastUpdatedAt: new Date(),
+    isComplete: false,
+  };
+
+  batchVerificationJobs.set(jobId, state);
+  return state;
+}
+
+/**
+ * Update batch job progress.
+ */
+function updateBatchJobProgress(
+  jobId: string,
+  result: VerificationCheckResult,
+  options: BatchVerificationOptions,
+): void {
+  const state = batchVerificationJobs.get(jobId);
+  if (!state) return;
+
+  state.results.push(result);
+  state.completed++;
+  state.lastUpdatedAt = new Date();
+  state.isComplete = state.completed >= state.total;
+
+  if (options.onProgress) {
+    const succeeded = state.results.filter((r) => r.status !== 'error').length;
+    const failed = state.results.filter((r) => r.status === 'error').length;
+    options.onProgress({
+      jobId,
+      total: state.total,
+      completed: state.completed,
+      succeeded,
+      failed,
+      percentage: Math.round((state.completed / state.total) * 100),
+      startedAt: state.startedAt,
+      lastUpdatedAt: state.lastUpdatedAt,
+      isComplete: state.isComplete,
+    });
+  }
+
+  // Clean up completed jobs after retention period
+  if (state.isComplete) {
+    setTimeout(() => {
+      batchVerificationJobs.delete(jobId);
+    }, JOB_RETENTION_MS);
+  }
+}
+
+/**
+ * Execute multiple verification checks with concurrency control and progress persistence.
+ * Supports resumption after SSE disconnects via jobId tracking.
  */
 export async function batchVerify(
   verifications: Array<{
@@ -47,9 +165,23 @@ export async function batchVerify(
   verifyFn: (address: string) => Promise<VerificationCheckResult>,
   options: BatchVerificationOptions = {},
 ): Promise<VerificationCheckResult[]> {
-  const { concurrency = 5, timeout = 10_000 } = options;
+  const { concurrency = 5, timeout = 10_000, jobId } = options;
 
-  const results: VerificationCheckResult[] = [];
+  // Initialize or resume job state
+  let state: BatchVerificationState | null = null;
+  if (jobId) {
+    state = initializeBatchJob(jobId, verifications.length);
+    
+    // Skip already processed items if resuming
+    const processedAddresses = new Set(
+      state.results.map((r) => r.stellar_address),
+    );
+    verifications = verifications.filter(
+      (v) => !processedAddresses.has(v.stellar_address),
+    );
+  }
+
+  const results: VerificationCheckResult[] = state?.results ?? [];
   const queue = [...verifications];
 
   const worker = async () => {
@@ -68,8 +200,12 @@ export async function batchVerify(
         ]);
 
         results.push(result);
+        
+        if (jobId) {
+          updateBatchJobProgress(jobId, result, options);
+        }
       } catch (error) {
-        results.push({
+        const errorResult: VerificationCheckResult = {
           username: item.username,
           stellar_address: item.stellar_address,
           status: 'error',
@@ -79,7 +215,12 @@ export async function batchVerify(
             trustline: false,
             reserve: false,
           },
-        });
+        };
+        results.push(errorResult);
+        
+        if (jobId) {
+          updateBatchJobProgress(jobId, errorResult, options);
+        }
       }
     }
   };
